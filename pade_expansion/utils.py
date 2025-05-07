@@ -107,7 +107,7 @@ def model_debug(model, MLP_class):
         model.model.layers[layer_index].mlp = MLP_class(llama_mlp, model.config, layer_index)
 
 
-def model_tylor_expansion(model,
+def model_pade_expansion(model,
                           MLP_class,
                           param_fname=None,
                           expand_layer=None,

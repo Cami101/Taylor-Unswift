@@ -6,7 +6,7 @@ import math
 # from transformers.models.llama.modeling_llama import LlamaMLP, LlamaDecoderLayer
 from .utils import silu_grad, dim_selection, min_dim_selection
 from .utils import model_debug as base_model_debug
-from .utils import model_tylor_expansion as base_model_tylor_expansion
+from .utils import model_pade_expansion as base_model_pade_expansion
 from .utils import hiddenstates_benchmark as base_hiddenstates_benchmark
 
 
@@ -96,9 +96,21 @@ class LlamaMLP_(nn.Module):
         # print(self.layer_index)
 
         return output
-
+    
+# Helper to compute Pade coefficients for exp (diagonal [m/m])
+def pade_exp_coeffs(m: int):
+    # returns a (size m+1) and b (size m) for Pade[m/m] of exp
+    # Known closed-form: a_k = (2m - k)! * m! / ((2m)! * k! * (m - k)!),
+    # b_k = (-1)**k * a_k
+    # See e.g. https://en.wikipedia.org/wiki/Pad%C3%A9_approximant#Examples
+    fac = math.factorial
+    denom = fac(2*m)
+    a = torch.tensor([fac(2*m - k) * fac(m) // (denom * fac(k) * fac(m - k)) for k in range(0, m+1)], dtype=torch.float32)
+    b = torch.tensor([(-1)**k * a[k] for k in range(1, m+1)], dtype=torch.float32)
+    return a, b
 
 class Tylor_expansion_LlamaMLP(nn.Module):
+    
     def __init__(self, llama_mlp, config, grad_order=6, select_dim=4, max_gap=10,
                  hidden_states_mean=None, hidden_states_std=None, hidden_states_max=None,
                  hidden_states_min=None, grad_order_min=4, delta_hidden_state_thd=2.5, bitwidth=1,
@@ -202,7 +214,28 @@ class Tylor_expansion_LlamaMLP(nn.Module):
         # self.fuse_weight = self.fuse_weight.cpu()
 
         # ipdb.set_trace()
-
+    @torch.no_grad()
+    def approx_output_pade(self, hidden_states):
+        # compute up and gate outputs
+        approx_up = hidden_states @ self.up_proj.weight.T
+        hidden_ffn1 = hidden_states @ self.gate_proj.weight.T
+        # Δh centered
+        delta = hidden_ffn1 - self.local_point
+        # build numerator P(Δh)
+        P = self.pade_a[0]
+        for i in range(1, self.pade_m+1):
+            P = P + self.pade_a[i] * (delta ** i)
+        # build denominator Q(Δh)
+        Q = torch.ones_like(delta)
+        for j in range(1, self.pade_n+1):
+            Q = Q + self.pade_b[j-1] * (delta ** j)
+        # rational R
+        R = P / Q
+        # merge with local_approx_output
+        # local_approx_output: [select_dim, hidden_size]
+        out = ((approx_up.unsqueeze(-2) * R.unsqueeze(-2)).sum(-1)) @ self.local_approx_output.T
+        return out
+    
     def act_grad(self, x, grad_order, dtype=torch.bfloat16):
 
         return silu_grad(x, grad_order, dtype)
@@ -422,55 +455,60 @@ class Tylor_expansion_LlamaMLP(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.forward_log_exp(hidden_states)
 
-    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    #
-    #     # self.fuse_weight = self.fuse_weight.to(self.ffn_up_proj_weight.device)
-    #
-    #     # hidden_states, = self.dtype_trans_fn(hidden_states)
-    #     # print(hidden_states.shape)
-    #     approx_output = self.approx_output_serial(hidden_states)
-    #     # approx_output_std = self.exact_forward(hidden_states)
-    #     # approx_output__ = self.approx_output_parallel(hidden_states)
-    #
-    #     # print((approx_output - approx_output_std).abs().sum())
-    #     # print((approx_output - approx_output__).abs().sum())
-    #     # ipdb.set_trace()
-    #
-    #     # approx_output, hidden_states = self.dtype_inverse_fn(approx_output, hidden_states)
-    #
-    #     # hidden_states_ffn1 = (hidden_states @ self.gate_proj_weight.T)
-    #     # hidden_error = (hidden_states_ffn1 - self.local_point).abs()
-    #     # print(hidden_error.max())
-    #
-    #
-    #
-    #     hidden_states_total = approx_output + ffn_output
-    #
-    #     # print(approx_output_)
-    #     # # print(approx_output__)
-    #     # print(approx_output)
-    #     # print((approx_output - approx_output_std).abs().sum())
-    #     # self.fuse_weight = self.fuse_weight.cpu()
-    #
-    #     return hidden_states_total
-
     def exact_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         up_output = hidden_states @ self.up_proj_weight.T
         gate_output = hidden_states @ self.original_gate_proj_weight.T
         return (self.act_fn(gate_output) * up_output) @ self.original_down_proj_weight.T
 
+class Pade_expansion_LlamaMLP(Tylor_expansion_LlamaMLP):
+    def __init__(self, llama_mlp, config,
+                 grad_order=6, select_dim=4, max_gap=10,
+                 hidden_states_mean=None, hidden_states_std=None,
+                 hidden_states_max=None, hidden_states_min=None,
+                 grad_order_min=4, delta_hidden_state_thd=2.5,
+                 layer_index=0):
+        # 1) call the parent __init__ to set up all the local_point, fuse_weight, etc.
+        super().__init__(llama_mlp, config,
+                         grad_order=grad_order,
+                         select_dim=select_dim,
+                         max_gap=max_gap,
+                         hidden_states_mean=hidden_states_mean,
+                         hidden_states_std=hidden_states_std,
+                         hidden_states_max=hidden_states_max,
+                         hidden_states_min=hidden_states_min,
+                         grad_order_min=grad_order_min,
+                         delta_hidden_state_thd=delta_hidden_state_thd,
+                         layer_index=layer_index)
+        # 2) now override or add your Pade coeffs
+        self.pade_m = grad_order // 2
+        self.pade_n = grad_order - self.pade_m
+        a, b = pade_exp_coeffs(self.pade_m)
+        a, b = a.to(self.local_point.dtype), b.to(self.local_point.dtype)
+        self.register_buffer('pade_a', a)
+        self.register_buffer('pade_b', b)
 
-# class Tylor_expansion_LlamaDecoderLayer(nn.Module):
-#     """This corresponds to the Block class in the timm implementation."""
-#
-#     def __init__(self, llama_layer) -> None:
-#         super().__init__()
-#
-#         self.hidden_size = llama_layer.hidden_size
-#         self.self_attn = llama_layer.self_attn
-#         self.mlp = llama_layer.mlp
-#         self.input_layernorm = llama_layer.input_layernorm
-#         self.post_attention_layernorm = llama_layer.post_attention_layernorm
+    @torch.no_grad()
+    def approx_output_log_exp(self, hidden_states):
+        # 1) standard up and gate projections
+        approx_up = hidden_states @ self.up_proj_weight.T              # [B, T, hidden]
+        hidden_ffn1 = hidden_states @ self.gate_proj_weight.T         # [B, T, select_dim]
+        # 2) center around local_point
+        delta = hidden_ffn1 - self.local_point                         # [B, T, select_dim]
+        # 3) numerator P(Δh):
+        P = self.pade_a[0]
+        for i in range(1, self.pade_m+1):
+            P = P + self.pade_a[i] * (delta ** i)
+        # 4) denominator Q(Δh):
+        Q = torch.ones_like(delta)
+        for j in range(1, self.pade_n+1):
+            Q = Q + self.pade_b[j-1] * (delta ** j)
+        # 5) rational R = P/Q
+        R = P / Q                                                      # [B, T, select_dim]
+        # 6) inject into the “down” projection just like Taylor did:
+        #    local_approx_output: [select_dim, hidden_size]
+        out = (approx_up * R) @ self.local_approx_output.T   # [B,T,hidden_size]
+        return out
+
 
 def hiddenstates_benchmark(model, fname):
     return base_hiddenstates_benchmark(model, fname)
@@ -480,7 +518,7 @@ def model_debug(model):
     return base_model_debug(model, LlamaMLP_)
 
 
-def model_tylor_expansion(model,
+def model_pade_expansion(model,
                            param_fname=None,
                            expand_layer=None,
                            select_dim=256,
@@ -488,8 +526,8 @@ def model_tylor_expansion(model,
                            max_gap=0,
                            grad_order_min=4,
                            delta_hidden_state_thd=2.5):
-    return base_model_tylor_expansion(model,
-                                      Tylor_expansion_LlamaMLP,
+    return base_model_pade_expansion(model,
+                                      Pade_expansion_LlamaMLP,
                                       param_fname,
                                       expand_layer,
                                       select_dim=select_dim,
@@ -502,58 +540,3 @@ def model_tylor_expansion(model,
 def model_power_forward(model):
     for layer_index in range(len(model.model.layers)):
         model.model.layers[layer_index].mlp.forward = model.model.layers[layer_index].mlp.forward_power
-
-# def approx_output_serial(self, hidden_states):
-#
-#     approx_up_output = (hidden_states @ self.up_proj_weight.T).unsqueeze(-1)
-#     hidden_states_ffn1 = (hidden_states @ self.gate_proj_weight.T)
-#
-#     delta_hidden_state = hidden_states_ffn1 - self.local_point
-#     delta_hidden_state_neg_factor = (delta_hidden_state > 0) * 2 - 1
-#     delta_hidden_state = delta_hidden_state.abs()
-#
-#     hidden_states_ffn1_2 = (hidden_states @ self.gate_proj_weight2.T)
-#     delta_hidden_state2 = hidden_states_ffn1_2 - self.local_point2
-#     delta_hidden_state_neg_factor2 = (delta_hidden_state2 > 0) * 2 - 1
-#     delta_hidden_state2 = delta_hidden_state2.abs()
-#     approx_output2 = self.local_approx_output.unsqueeze(0).unsqueeze(0) @ approx_up_output
-#
-#     approx_output = self.local_approx_output.unsqueeze(0).unsqueeze(0) @ approx_up_output
-#     for grad_idx in range(self.grad_order):
-#         log_discount_term = torch.log(delta_hidden_state) * self.grad_order_buf[grad_idx] - self.discount_factor[grad_idx]
-#         odd_grad_order_flag = (self.grad_order_buf[grad_idx] % 2).type(torch.bool)
-#         if odd_grad_order_flag:
-#             discount_term = torch.exp(log_discount_term) * delta_hidden_state_neg_factor
-#         else:
-#             discount_term = torch.exp(log_discount_term)
-#
-#         # term_value = self.fuse_weight[:, :, grad_idx].unsqueeze(0).unsqueeze(0) * discount_term.unsqueeze(-2)
-#         # approx_output = approx_output + (term_value @ approx_up_output)
-#
-#         tmp_value = discount_term.unsqueeze(-1) * approx_up_output
-#         term_value = self.fuse_weight[:, :, grad_idx].unsqueeze(0).unsqueeze(0) @ tmp_value
-#         approx_output = approx_output + term_value
-#
-#
-#         log_discount_term2 = torch.log(delta_hidden_state2) * self.grad_order_buf[grad_idx] - self.discount_factor[grad_idx]
-#         if odd_grad_order_flag:
-#             discount_term2 = torch.exp(log_discount_term2) * delta_hidden_state_neg_factor2
-#         else:
-#             discount_term2 = torch.exp(log_discount_term2)
-#
-#         tmp_value2 = discount_term2.unsqueeze(-1) * approx_up_output
-#         term_value2 = self.fuse_weight2[:, :, grad_idx].unsqueeze(0).unsqueeze(0) @ tmp_value2
-#         approx_output2 = approx_output2 + term_value2
-#         print(term_value[0,0,:10,0])
-#         print(term_value2[0,0,:10,0])
-#
-#
-#         # ipdb.set_trace()
-#         # CyxA
-#
-#         # del tmp_value, term_value
-#     print(approx_output[0,0,:10,0])
-#     print(approx_output2[0,0,:10,0])
-#     ipdb.set_trace()
-#
-#     return approx_output.squeeze(-1)

@@ -1,4 +1,4 @@
-This is the official codes for Taylor Unswift: Secured Weight Access for Large Language Models via Taylor Expansion.
+This is the adaption code of Pade Approximation of LLMs base on the paper Taylor Unswift: Secured Weight Access for Large Language Models via Taylor Expansion.
 
 
 ## Dependency
@@ -11,18 +11,19 @@ accelerate==0.29.2
 scikit-learn==1.4.2
 peft==0.10.0
 transformers==4.38.1
-flash-attn==2.5.7
+evaluate==0.4.3
+ipdb==0.13.13
 ```
 
 
-## Test TaylorMLP on the COQA and wikitext-2 datasets:
-
-Use TaylorMLP to secure Llama-3-8B, then generate tokens using input context from the COQA and wikitext-2 datasets:
+## Test PadeMLP on the wikitext-2, truthul qa, and mmlu datasets:
 
 ```bash 
-python protection/llama_protection.py 
-python protection/llama_wikitext_test.py
+python protection/llama_MN2.py 
+python protection/llama_MN4.py
+or a simple example run:
+
 ```
 
-Results: TaylorMLP takes around 4x latency compared with the original Llama-3-8B.
+Results: 
 

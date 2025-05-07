@@ -13,7 +13,7 @@ sys.path.append("./")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
-from tylor_expansion.llama import model_tylor_expansion
+from pade_expansion.llama import model_pade_expansion
 # from util import model_expand, print_model_parameters, freeze_model_parameters, zero_model_parameters, ViTBase2Large
 
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
@@ -24,12 +24,14 @@ tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct",
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct",
                                              cache_dir="/scratch",
                                              torch_dtype=eval(dtype),
-                                             use_flash_attention_2=True
+                                             # use_flash_attention_2= True
+                                             attn_implementation = "eager"
                                              )
 model_expansion = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct",
                                              cache_dir="/scratch",
                                              torch_dtype=eval(dtype), # torch.float32, # torch.float16 #
-                                             use_flash_attention_2=True
+                                             # use_flash_attention_2= True
+                                             attn_implementation = "eager"
                                              )
 # context_buf = [ "Robert <unk> is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . This was followed by a starring role in the play Herons written by Simon Stephens , which was performed in 2001 at the Royal Court Theatre . He had a guest role in the television series Judge John <unk> in 2002 . In 2004 <unk> landed a role as ' Craig ' in the episode ' Teddy 's Story ' of the television series The Long Firm ; he starred alongside actors Mark Strong and Derek Jacobi . He was cast in the 2005 theatre productions of the Philip Ridley play Mercury Fur , which was performed at the Drum Theatre in Plymouth and the <unk> <unk> Factory in London . He was directed by John <unk> and starred alongside Ben <unk> , Shane <unk> , Harry Kent , Fraser <unk> , Sophie Stanton and Dominic Hall ."]
 context_buf = [ "Although initially he was little @-@ known to other writers , his works came to be hugely influential in both Chinese and Japanese literary culture . Of his poetic writing , nearly fifteen hundred poems have been preserved over the ages . He has been called the ' Poet @-@ Historian ' and the ' Poet @-@ Sage ' by Chinese critics , while the range of his work has allowed him to be introduced to Western readers as ' the Chinese Virgil , Horace , <unk> , Shakespeare , Milton , Burns , <unk> , <unk> , Hugo or <unk> ' ."]
@@ -60,14 +62,14 @@ outputs1 = tokenizer.batch_decode(generate_ids1[:, inputs.input_ids.shape[-1]:],
 # print("============================")
 del model
 
-select_dim = 8000
+select_dim = 4096
 grad_order = 8
 grad_order_min = 8
 delta_hidden_state_thd = 2.5
 expand_layer = None
 
 model_expansion = model_expansion.cuda()
-model_tylor_expansion(model_expansion,
+model_pade_expansion(model_expansion,
                       "./output/llama-3-8b-hf-pileval-hidden-states/hidden-states-" + dtype + "-n-20000-len-4096.pth.tar",
                       select_dim=select_dim,
                       grad_order=grad_order,
