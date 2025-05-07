@@ -1,4 +1,4 @@
-This is the adaption code of Pade Approximation of LLMs base on the paper Taylor Unswift: Secured Weight Access for Large Language Models via Taylor Expansion.
+This is the adaption code of Padé Approximation of LLMs base on the paper Taylor Unswift: Secured Weight Access for Large Language Models via Taylor Expansion.
 
 
 ## Dependency
@@ -22,8 +22,8 @@ ipdb==0.13.13
 python protection/llama_MN2.py 
 python protection/llama_MN4.py
 or a simple example run:
-
+python protection/llama_wikitext_test.py
 ```
 
 Results: 
-
+With Padé approximation of m = n = 4, we achieves 10x+ latency while closely approximates the original Llama's capability.
