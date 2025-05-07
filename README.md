@@ -16,7 +16,7 @@ ipdb==0.13.13
 ```
 
 
-## Test PadeMLP on the wikitext-2, truthul qa, and mmlu datasets:
+## Test PadeMLP on the wikitext-2, truthful QA, and mmlu datasets:
 
 ```bash 
 python protection/llama_MN2.py 
